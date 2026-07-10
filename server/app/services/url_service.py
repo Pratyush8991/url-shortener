@@ -20,22 +20,29 @@ class URLService:
         self.public_base_url = public_base_url.rstrip("/")
     
     # Create
-    def create_short_url(self, originalUrl: HttpUrl, alias: str = None, expirationTime = None) -> str:
+    def create_short_url(self, originalUrl: HttpUrl, alias: str = None, expirationTime: datetime | None = None) -> str:
         original_url = self.parse_url(originalUrl)
         
         if not alias:
-            code = self.url_strategy.create_short_code(original_url)
-            short_url = f"{self.public_base_url}/{code}"
-            
-            mapping = self.repo.find_by_short_code(code)
-            if mapping and not self.is_expired(mapping):
-                return short_url
-            if mapping and self.is_expired(mapping):
-                self.repo.reactivate_mapping(mapping, expirationTime)
-                return short_url
+            attempt = 0
+            while True:
+                code = self.url_strategy.create_short_code(original_url, attempt)
+                mapping = self.repo.find_by_short_code(code)
+                short_url = f"{self.public_base_url}/{code}"
 
-            self.repo.store_short_code(original_url, code, alias, expirationTime)
-            return short_url
+                if mapping is None:
+                    self.repo.store_short_code(original_url, code, alias, expirationTime)
+                    return short_url
+
+                if mapping.original_url == original_url:
+                    if expirationTime != mapping.expiration_time:
+                        self.repo.update_expiration(mapping, expirationTime)
+                    
+                    return short_url
+                
+                attempt += 1
+
+                
         else:
             short_url = f"{self.public_base_url}/{alias}"
             alias_mapping = self.repo.find_by_alias(alias)

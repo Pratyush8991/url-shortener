@@ -11,8 +11,8 @@ from app.strategies.base import UrlCreationStrategy
 
 
 class HashUrlCreationStrategy(UrlCreationStrategy):
-    def create_short_code(self, original_url: str) -> str:
-        hash_digest = hashlib.sha256(original_url.encode('utf-8')).digest()
+    def create_short_code(self, original_url: str, attempt: int = 0) -> str:
+        hash_digest = hashlib.sha256((f"{original_url}#{attempt}").encode('utf-8')).digest()
         hash_number = int.from_bytes(hash_digest, byteorder="big")
         short_code = base62.encode(hash_number)[:6]
 

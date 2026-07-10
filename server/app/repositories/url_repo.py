@@ -31,7 +31,7 @@ class UrlRepository:
         self.db.refresh(mapping)
         return mapping
 
-    def reactivate_mapping(self, mapping: UrlMapping, expiration_time=None) -> UrlMapping:
+    def update_expiration(self, mapping: UrlMapping, expiration_time=None) -> UrlMapping:
         mapping.expiration_time = expiration_time
         self.db.commit()
         self.db.refresh(mapping)
