@@ -10,8 +10,9 @@
 from datetime import datetime
 
 from pydantic import HttpUrl
-from app.exceptions import AliasAlreadyExistsError
+from app.exceptions import AliasAlreadyExistsError, ShortCodeExhaustionError
 from app.repositories.url_repo import UrlRepository
+from app.config import ATTEMPT_CAP
 
 class URLService:
     def __init__(self, repo: UrlRepository, url_creation_strategy, public_base_url: str):
@@ -25,36 +26,40 @@ class URLService:
         
         if not alias:
             attempt = 0
-            while True:
+            while attempt <= ATTEMPT_CAP:
                 code = self.url_strategy.create_short_code(original_url, attempt)
-                mapping = self.repo.find_by_short_code(code)
                 short_url = f"{self.public_base_url}/{code}"
 
-                if mapping is None:
-                    self.repo.store_short_code(original_url, code, alias, expirationTime)
-                    return short_url
+                # Instead of splitting the find then insert,
+                # turn it into one transaction - UPSERT.
+                # Update or Insert - on conflict, do nothing.
+                
+                mapping = self.repo.find_and_store_short_code(original_url, code, alias, expirationTime)
 
                 if mapping.original_url == original_url:
                     if expirationTime != mapping.expiration_time:
-                        self.repo.update_expiration(mapping, expirationTime)
-                    
+                        self.repo.update_mapping(mapping=mapping, original_url=original_url, expiration_time=expirationTime)
+                
                     return short_url
-                
-                attempt += 1
+                # Hash collision case - a short code mapped to two different original URLs.
+                else:
+                    attempt += 1
 
-                
+
+            raise ShortCodeExhaustionError(original_url)
+
         else:
             short_url = f"{self.public_base_url}/{alias}"
-            alias_mapping = self.repo.find_by_alias(alias)
+
+            alias_mapping = self.repo.find_and_store_short_code(original_url=original_url, short_code=alias, alias=alias, expiration_time=expirationTime)
             
-            if not alias_mapping:
-                self.repo.store_short_code(original_url, alias, alias, expirationTime)
-                return short_url
-            
-            if not self.is_expired(alias_mapping):
+            if alias_mapping.original_url != original_url and not self.is_expired(alias_mapping):
                 raise AliasAlreadyExistsError(alias)
 
-            self.repo.reassign_expired_alias(alias_mapping, original_url, expirationTime)
+            # Skip the write on a fresh insert (nothing changed); only write on a
+            # same-owner expiration change or an expired-alias reclaim.
+            if alias_mapping.original_url != original_url or expirationTime != alias_mapping.expiration_time:
+                self.repo.update_mapping(mapping=alias_mapping, original_url=original_url, expiration_time=expirationTime)
             return short_url
 
     def parse_url(self, url: HttpUrl) -> str:

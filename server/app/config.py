@@ -5,7 +5,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
-
+ATTEMPT_CAP = 5
 
 class Settings(BaseSettings):
     database_url: str

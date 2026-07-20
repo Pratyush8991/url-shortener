@@ -104,8 +104,8 @@ mapping.original_url != original_url  -> collision: attempt += 1, re-hash and re
 > identical sequence — `hash(url,0)`, `hash(url,1)`, … — and re-lands on the same code, so
 > deduplication survives collisions.
 
-**Planned:** an attempt cap (`attempt > MAX_PROBE_ATTEMPTS` → error) so a pathological input
-can't loop forever, and the atomic-upsert race fix (§7) folded into the "free slot" branch.
+The "free slot" insert is done atomically via the upsert in §7. **Still planned:** an attempt
+cap (`attempt > MAX_PROBE_ATTEMPTS` → error) so a pathological input can't loop forever.
 
 ---
 
@@ -145,11 +145,14 @@ If no mapping exists:
 If alias is free:
     create mapping with short_code = alias
 
-If alias exists and is ACTIVE:
+If alias is held by a DIFFERENT url and still ACTIVE:
     reject with 409 Conflict
 
-If alias exists and is EXPIRED:
-    reassign it to the new original_url (keep the alias string)
+If alias is held by the SAME url (owner re-request):
+    keep the alias; last-write-wins on expiration (same rule as hash codes)
+
+If alias is held by ANY url but EXPIRED:
+    reclaim it for the new original_url (keep the alias string)
     set expiration from the request
 ```
 
@@ -157,9 +160,13 @@ If alias exists and is EXPIRED:
   Aliases are scarce, human-chosen strings (`promo2024`); it's desirable that an expired one
   can be grabbed by someone else. Determinism doesn't apply because the code isn't derived
   from the URL.
-- **Known inconsistency to revisit:** the active-alias branch returns 409 even when the
-  *same* URL owns the alias, so "same owner extends their own alias" works for hash codes
-  but 409s for aliases. To be reconciled when the alias path is revisited.
+- **Same-owner re-request is allowed (reconciled).** An active alias returns 409 only for a
+  *different* URL; the owning URL may re-request to extend/update its expiration, matching the
+  hash-code path. This resolves the earlier inconsistency where owners were wrongly 409'd.
+- **Shared namespace with hash codes.** Aliases are stored in the same `short_code` column as
+  hash codes, so an alias can collide with an existing hash code (and vice versa). Availability
+  is therefore keyed on `short_code`, not `alias` — the alias path reads back the occupant via
+  `find_by_short_code`, so a hash code occupying the string correctly blocks the alias.
 
 ### Redirects
 
@@ -176,17 +183,32 @@ If alias exists and is EXPIRED:
 
 ---
 
-## 7. Concurrency: read-then-write race *(planned fix)*
+## 7. Concurrency: read-then-write race *(implemented)*
 
-The "free slot" insert is currently two statements — `find_by_short_code` then
-`store_short_code` — so two concurrent creates of the same new URL can both read `None`,
-both insert, and the loser hits the `unique(short_code)` constraint → unhandled 500. This is
-a **data-layer** race and is *not* solved by async; it needs atomicity at the DB.
+A naive "find then insert" is two statements, so two concurrent creates of the same new URL
+can both see "empty," both insert, and the loser hits the `unique(short_code)` constraint →
+unhandled 500. This is a **data-layer** race and is *not* solved by async; it needs atomicity
+at the DB.
 
-Planned fix: an **atomic upsert** (`INSERT ... ON CONFLICT (short_code) DO NOTHING
-RETURNING *`); if nothing is returned, someone else won — re-read. On `IntegrityError`,
-`continue` the probe loop **without** incrementing `attempt` (re-read the same code: if a
-*different* URL now owns it, the collision branch advances the attempt; if it's ours, reuse).
+Fix: `find_and_store_short_code` does an **atomic upsert then reads back the occupant**:
+
+```
+INSERT ... ON CONFLICT (short_code) DO NOTHING     -- one atomic statement
+SELECT ... WHERE short_code = :code                -- read back whoever now holds it
+```
+
+`DO NOTHING` swallows the conflict (no exception), and the read-back returns the row that
+occupies the code — whether we inserted it or someone else did. The service then compares
+`original_url`: if it's ours, reuse (and last-write-wins on expiration); if it's a different
+URL, it's a collision and the loop advances `attempt` and probes the next code. No
+`IntegrityError` handling is needed because `DO NOTHING` never raises.
+
+- **Why `DO NOTHING` + read-back, not `DO UPDATE ... RETURNING`?** `DO UPDATE` writes the row
+  on *every* conflict (MVCC dead tuples + a row lock), turning every duplicate create into a
+  write. An indexed point-lookup read-back is cheaper than that write amplification. `DO NOTHING`
+  also returns nothing on conflict, which is why a separate read is required to get the row.
+- **Optimization (not yet applied):** add `RETURNING` so the insert path returns the row in
+  one round trip, falling back to the read only on conflict.
 
 ---
 
@@ -214,7 +236,8 @@ cost of adding a reverse index on `original_url` to keep dedup.
 
 ### Roadmap
 
-- [ ] Atomic-upsert race fix + attempt cap (§7, §5)
+- [x] Atomic-upsert race fix (§7)
+- [ ] Attempt cap on the probe loop (§5)
 - [ ] Health endpoints + explicit connection-pool config
 - [ ] Timezone validator (UTC-only at the edge)
 - [ ] GC job for expired rows

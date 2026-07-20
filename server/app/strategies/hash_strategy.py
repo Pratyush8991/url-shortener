@@ -3,7 +3,7 @@
 2. SHA 256 hash the above - Need to encode string into bytes before hashing it. Use utf-8 to encode it. 
 Or simply just use the b literal in front of the string to automatically instantiate it as byte literal.
 3. base62 encode it
-4. Take the first 6 words and return the result
+4. Take the first 6 characters and return the result
 """
 import hashlib
 import base62
